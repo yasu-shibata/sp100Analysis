@@ -1,14 +1,12 @@
 """
 Streamlit S&P100 Growth Analysis App
-Analyzes S&P100 stocks by analyst recommendations with technical analysis
+Analyzes S&P100 stocks by analyst recommendations with technical indicators
 """
 
 import streamlit as st
 import pandas as pd
 import datetime as dt
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import yfinance as yf
 import requests
 import time
@@ -22,8 +20,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-plt.rcParams['font.family'] = 'sans-serif'
 
 # Cache functions
 @st.cache_data(ttl=86400)  # Cache for 24 hours
@@ -66,9 +62,58 @@ def fetch_stock_data(symbol, period="6mo"):
     except Exception as e:
         return None, str(e)
 
+def calculate_macd_crossover_days(macd_series, signal_series):
+    """Calculate days since MACD crossover"""
+    days_since_crossover = []
+    last_crossover_idx = None
+    crossover_type = None
+    
+    for i in range(len(macd_series)):
+        if i == 0:
+            days_since_crossover.append(np.nan)
+            continue
+        
+        prev_diff = macd_series.iloc[i-1] - signal_series.iloc[i-1]
+        curr_diff = macd_series.iloc[i] - signal_series.iloc[i]
+        
+        if (prev_diff <= 0 and curr_diff > 0) or (prev_diff >= 0 and curr_diff < 0):
+            last_crossover_idx = i
+            days_since_crossover.append(0)
+            crossover_type = "Bullish" if curr_diff > 0 else "Bearish"
+        elif last_crossover_idx is not None:
+            days_since_crossover.append(i - last_crossover_idx)
+        else:
+            days_since_crossover.append(np.nan)
+    
+    return pd.Series(days_since_crossover, index=macd_series.index), crossover_type
+
+def calculate_technical_indicators(data):
+    """Calculate technical indicators"""
+    df = data.copy()
+    
+    # Moving Averages
+    df['SMA_20'] = df['Close'].rolling(window=20).mean()
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    
+    # EMA & MACD
+    df['EMA_12'] = df['Close'].ewm(span=12).mean()
+    df['EMA_26'] = df['Close'].ewm(span=26).mean()
+    df['MACD'] = df['EMA_12'] - df['EMA_26']
+    df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
+    df['MACD_Histogram'] = df['MACD'] - df['MACD_Signal']
+    
+    # RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    return df
+
 @st.cache_data(ttl=3600)
-def get_analyst_estimates(ticker):
-    """Get analyst estimates and recommendations"""
+def get_analyst_and_technical_data(ticker):
+    """Get analyst estimates and technical indicators"""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -98,6 +143,39 @@ def get_analyst_estimates(ticker):
         if not all([target_price, current_price, current_price > 0, analyst_rec_score]):
             return None
         
+        # Fetch historical data for technical analysis
+        hist_data, error = fetch_stock_data(ticker, period="6mo")
+        
+        rsi = np.nan
+        macd = np.nan
+        macd_signal = np.nan
+        macd_hist = np.nan
+        macd_crossover_days = np.nan
+        macd_crossover_type = "N/A"
+        
+        if hist_data is not None:
+            tech_data = calculate_technical_indicators(hist_data)
+            latest = tech_data.iloc[-1]
+            
+            rsi = latest['RSI']
+            macd = latest['MACD']
+            macd_signal = latest['MACD_Signal']
+            macd_hist = latest['MACD_Histogram']
+            
+            # Calculate crossover info
+            crossover_series, cross_type = calculate_macd_crossover_days(
+                tech_data['MACD'], 
+                tech_data['MACD_Signal']
+            )
+            
+            if not np.isnan(crossover_series.iloc[-1]):
+                macd_crossover_days = int(crossover_series.iloc[-1])
+                # Determine current crossover type
+                if macd > macd_signal:
+                    macd_crossover_type = "Bullish"
+                else:
+                    macd_crossover_type = "Bearish"
+        
         return {
             'ticker': ticker,
             'company_name': info.get('longName', ticker),
@@ -105,132 +183,37 @@ def get_analyst_estimates(ticker):
             'current_price': current_price,
             'target_price': target_price,
             'price_upside_pct': ((target_price - current_price) / current_price) * 100,
-            'earnings_growth': info.get('earningsGrowth') or info.get('earningsQuarterlyGrowth'),
-            'revenue_growth': info.get('revenueGrowth') or info.get('revenueQuarterlyGrowth'),
-            'peg_ratio': info.get('pegRatio'),
             'analyst_rec_score': analyst_rec_score,
             'next_earnings_date': next_earnings_date,
+            'rsi': rsi,
+            'macd': macd,
+            'macd_signal': macd_signal,
+            'macd_histogram': macd_hist,
+            'macd_crossover_days': macd_crossover_days,
+            'macd_crossover_type': macd_crossover_type,
         }
     except Exception:
         return None
 
-def calculate_macd_crossover_days(macd_series, signal_series):
-    """Calculate days since MACD crossover"""
-    days_since_crossover = []
-    last_crossover_idx = None
-    
-    for i in range(len(macd_series)):
-        if i == 0:
-            days_since_crossover.append(np.nan)
-            continue
-        
-        prev_diff = macd_series.iloc[i-1] - signal_series.iloc[i-1]
-        curr_diff = macd_series.iloc[i] - signal_series.iloc[i]
-        
-        if (prev_diff <= 0 and curr_diff > 0) or (prev_diff >= 0 and curr_diff < 0):
-            last_crossover_idx = i
-            days_since_crossover.append(0)
-        elif last_crossover_idx is not None:
-            days_since_crossover.append(i - last_crossover_idx)
-        else:
-            days_since_crossover.append(np.nan)
-    
-    return pd.Series(days_since_crossover, index=macd_series.index)
-
-def calculate_technical_indicators(data):
-    """Calculate technical indicators"""
-    df = data.copy()
-    
-    # Moving Averages
-    df['SMA_20'] = df['Close'].rolling(window=20).mean()
-    df['SMA_50'] = df['Close'].rolling(window=50).mean()
-    
-    # EMA & MACD
-    df['EMA_12'] = df['Close'].ewm(span=12).mean()
-    df['EMA_26'] = df['Close'].ewm(span=26).mean()
-    df['MACD'] = df['EMA_12'] - df['EMA_26']
-    df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
-    df['MACD_Histogram'] = df['MACD'] - df['MACD_Signal']
-    df['MACD_Crossover_Days'] = calculate_macd_crossover_days(df['MACD'], df['MACD_Signal'])
-    
-    # RSI
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    # Bollinger Bands
-    df['BB_Middle'] = df['Close'].rolling(window=20).mean()
-    bb_std = df['Close'].rolling(window=20).std()
-    df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
-    df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
-    
-    # Volume
-    df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
-    
-    return df
-
-def plot_technical_chart(data, symbol, company_name):
-    """Create technical analysis chart"""
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12, 10),
-                                              gridspec_kw={'height_ratios': [3, 1, 1, 1]})
-    
-    # Price chart
-    ax1.plot(data.index, data['Close'], linewidth=2, label='Close', color='black')
-    ax1.plot(data.index, data['SMA_20'], label='SMA 20', alpha=0.7, color='blue')
-    ax1.plot(data.index, data['SMA_50'], label='SMA 50', alpha=0.7, color='red')
-    ax1.fill_between(data.index, data['BB_Upper'], data['BB_Lower'], alpha=0.1, color='gray')
-    ax1.set_title(f"{symbol} - {company_name}", fontsize=14, fontweight='bold')
-    ax1.set_ylabel('Price ($)')
-    ax1.legend(loc='upper left')
-    ax1.grid(True, alpha=0.3)
-    
-    # Volume
-    colors = ['green' if c >= o else 'red' for c, o in zip(data['Close'], data['Open'])]
-    ax2.bar(data.index, data['Volume'], color=colors, alpha=0.7)
-    ax2.plot(data.index, data['Volume_MA'], color='orange', linewidth=2, label='MA 20')
-    ax2.set_ylabel('Volume')
-    ax2.legend(loc='upper left')
-    ax2.grid(True, alpha=0.3)
-    
-    # RSI
-    ax3.plot(data.index, data['RSI'], color='purple', linewidth=2)
-    ax3.axhline(y=70, color='red', linestyle='--', alpha=0.7)
-    ax3.axhline(y=30, color='blue', linestyle='--', alpha=0.7)
-    ax3.fill_between(data.index, 30, 70, alpha=0.1, color='gray')
-    ax3.set_ylabel('RSI')
-    ax3.set_ylim(0, 100)
-    ax3.grid(True, alpha=0.3)
-    
-    # MACD
-    ax4.plot(data.index, data['MACD'], color='blue', linewidth=2, label='MACD')
-    ax4.plot(data.index, data['MACD_Signal'], color='red', linewidth=2, label='Signal')
-    colors_macd = ['green' if val >= 0 else 'red' for val in data['MACD_Histogram']]
-    ax4.bar(data.index, data['MACD_Histogram'], alpha=0.3, color=colors_macd)
-    ax4.axhline(y=0, color='black', alpha=0.5)
-    ax4.set_ylabel('MACD')
-    ax4.legend(loc='upper left')
-    ax4.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    return fig
-
 def main():
     st.title("S&P100 Growth Analysis Dashboard")
-    st.markdown("Analyze S&P100 stocks by analyst recommendations with technical analysis")
+    st.markdown("Analyze S&P100 stocks by analyst recommendations with technical indicators")
     st.markdown("---")
     
     # Sidebar
     with st.sidebar:
         st.header("Settings")
         
-        # Analysis options
-        top_n = st.slider("Number of Top Stocks", min_value=5, max_value=30, value=20, step=5)
+        top_n = st.slider("Number of Top Stocks", min_value=10, max_value=100, value=20, step=5)
         
-        technical_top_n = st.slider("Technical Analysis (Top N)", min_value=3, max_value=15, value=10, step=1)
+        sort_by = st.selectbox(
+            "Sort By",
+            ["Analyst Rec Score", "Price Upside %", "RSI", "MACD Histogram"]
+        )
         
-        include_spy = st.checkbox("Include SPY in Technical Analysis", value=True)
+        filter_rsi = st.checkbox("Filter by RSI", value=False)
+        if filter_rsi:
+            rsi_min, rsi_max = st.slider("RSI Range", 0, 100, (30, 70))
         
         analyze_button = st.button("Start Analysis", type="primary", use_container_width=True)
         
@@ -238,9 +221,16 @@ def main():
         st.markdown("""
         **Analysis Method:**
         - Fetches S&P100 constituents
-        - Ranks by analyst recommendation score
-        - Lower score = Stronger Buy recommendation
-        - Performs technical analysis on top stocks
+        - Retrieves analyst recommendations
+        - Calculates technical indicators (RSI, MACD)
+        - Tracks MACD crossover information
+        
+        **Recommendation Score:**
+        - 1.0 = Strong Buy
+        - 2.0 = Buy
+        - 3.0 = Hold
+        - 4.0 = Sell
+        - 5.0 = Strong Sell
         """)
     
     # Main content
@@ -257,7 +247,7 @@ def main():
         
         # Step 2: Analyze stocks
         st.markdown("---")
-        st.header("Analyst Recommendation Analysis")
+        st.header("Comprehensive Stock Analysis")
         
         growth_data = []
         
@@ -266,7 +256,7 @@ def main():
         
         for i, ticker in enumerate(tickers):
             status_text.text(f"Analyzing {ticker}... ({i+1}/{len(tickers)})")
-            data = get_analyst_estimates(ticker)
+            data = get_analyst_and_technical_data(ticker)
             if data:
                 growth_data.append(data)
             progress_bar.progress((i + 1) / len(tickers))
@@ -276,174 +266,143 @@ def main():
         status_text.empty()
         
         if not growth_data:
-            st.error("No analyst data could be retrieved")
+            st.error("No data could be retrieved")
             return
         
-        # Create DataFrame and sort
+        # Create DataFrame
         df = pd.DataFrame(growth_data)
-        df_sorted = df.sort_values('analyst_rec_score', ascending=True).head(top_n)
+        
+        # Apply filters
+        if filter_rsi:
+            df = df[(df['rsi'] >= rsi_min) & (df['rsi'] <= rsi_max)]
+        
+        # Sort based on selection
+        if sort_by == "Analyst Rec Score":
+            df_sorted = df.sort_values('analyst_rec_score', ascending=True)
+        elif sort_by == "Price Upside %":
+            df_sorted = df.sort_values('price_upside_pct', ascending=False)
+        elif sort_by == "RSI":
+            df_sorted = df.sort_values('rsi', ascending=True)
+        else:  # MACD Histogram
+            df_sorted = df.sort_values('macd_histogram', ascending=False)
+        
+        df_sorted = df_sorted.head(top_n)
         
         # Display results
-        st.subheader(f"Top {top_n} Stocks by Analyst Recommendation")
-        st.info("Lower recommendation score = Stronger Buy recommendation (1.0 = Strong Buy, 5.0 = Strong Sell)")
+        st.subheader(f"Top {len(df_sorted)} Stocks")
+        st.info(f"Sorted by: {sort_by} | Total stocks analyzed: {len(df)}")
         
         # Create display dataframe
-        display_df = df_sorted[['ticker', 'company_name', 'sector', 'current_price', 
-                                'target_price', 'price_upside_pct', 'analyst_rec_score', 
-                                'next_earnings_date']].copy()
+        display_df = df_sorted[[
+            'ticker', 'company_name', 'sector', 'current_price', 'target_price', 
+            'price_upside_pct', 'analyst_rec_score', 'rsi', 'macd', 'macd_signal',
+            'macd_histogram', 'macd_crossover_days', 'macd_crossover_type', 
+            'next_earnings_date'
+        ]].copy()
         
-        display_df.columns = ['Ticker', 'Company', 'Sector', 'Price ($)', 'Target ($)', 
-                             'Upside (%)', 'Rec Score', 'Next Earnings']
+        display_df.columns = [
+            'Ticker', 'Company', 'Sector', 'Price', 'Target', 'Upside %', 
+            'Rec Score', 'RSI', 'MACD', 'Signal', 'MACD Hist', 
+            'Cross Days', 'Cross Type', 'Next Earnings'
+        ]
         
-        display_df['Price ($)'] = display_df['Price ($)'].apply(lambda x: f"${x:.2f}")
-        display_df['Target ($)'] = display_df['Target ($)'].apply(lambda x: f"${x:.2f}")
-        display_df['Upside (%)'] = display_df['Upside (%)'].apply(lambda x: f"{x:.1f}%")
-        display_df['Rec Score'] = display_df['Rec Score'].apply(lambda x: f"{x:.2f}")
+        # Format numeric columns
+        display_df['Price'] = display_df['Price'].apply(lambda x: f"${x:.2f}" if not np.isnan(x) else "N/A")
+        display_df['Target'] = display_df['Target'].apply(lambda x: f"${x:.2f}" if not np.isnan(x) else "N/A")
+        display_df['Upside %'] = display_df['Upside %'].apply(lambda x: f"{x:.1f}%" if not np.isnan(x) else "N/A")
+        display_df['Rec Score'] = display_df['Rec Score'].apply(lambda x: f"{x:.2f}" if not np.isnan(x) else "N/A")
+        display_df['RSI'] = display_df['RSI'].apply(lambda x: f"{x:.1f}" if not np.isnan(x) else "N/A")
+        display_df['MACD'] = display_df['MACD'].apply(lambda x: f"{x:.4f}" if not np.isnan(x) else "N/A")
+        display_df['Signal'] = display_df['Signal'].apply(lambda x: f"{x:.4f}" if not np.isnan(x) else "N/A")
+        display_df['MACD Hist'] = display_df['MACD Hist'].apply(lambda x: f"{x:.4f}" if not np.isnan(x) else "N/A")
+        display_df['Cross Days'] = display_df['Cross Days'].apply(lambda x: f"{int(x)}" if not np.isnan(x) else "N/A")
         
-        # Color code recommendation score
+        # Apply color coding
         def color_rec_score(val):
             try:
                 score = float(val)
                 if score <= 2.0:
-                    return 'background-color: #90EE90'  # Light green
+                    return 'background-color: #90EE90'
                 elif score <= 3.0:
-                    return 'background-color: #FFFFE0'  # Light yellow
+                    return 'background-color: #FFFFE0'
                 else:
-                    return 'background-color: #FFB6C6'  # Light red
+                    return 'background-color: #FFB6C6'
             except:
                 return ''
         
+        def color_rsi(val):
+            try:
+                rsi = float(val)
+                if rsi < 30:
+                    return 'background-color: #90EE90'
+                elif rsi > 70:
+                    return 'background-color: #FFB6C6'
+                else:
+                    return ''
+            except:
+                return ''
+        
+        def color_crossover_type(val):
+            if val == 'Bullish':
+                return 'background-color: #90EE90'
+            elif val == 'Bearish':
+                return 'background-color: #FFB6C6'
+            else:
+                return ''
+        
+        styled_df = display_df.style\
+            .applymap(color_rec_score, subset=['Rec Score'])\
+            .applymap(color_rsi, subset=['RSI'])\
+            .applymap(color_crossover_type, subset=['Cross Type'])
+        
         st.dataframe(
-            display_df.style.applymap(color_rec_score, subset=['Rec Score']),
+            styled_df,
             use_container_width=True,
             hide_index=True
         )
         
-        # Sector distribution
+        # Download button
+        csv = df_sorted.to_csv(index=False)
+        st.download_button(
+            label="Download as CSV",
+            data=csv,
+            file_name=f"sp100_analysis_{dt.datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+        
+        # Summary statistics
+        st.markdown("---")
+        st.subheader("Summary Statistics")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            avg_rec_score = df_sorted['analyst_rec_score'].mean()
+            st.metric("Avg Rec Score", f"{avg_rec_score:.2f}")
+        
+        with col2:
+            avg_upside = df_sorted['price_upside_pct'].mean()
+            st.metric("Avg Upside", f"{avg_upside:.1f}%")
+        
+        with col3:
+            avg_rsi = df_sorted['rsi'].mean()
+            st.metric("Avg RSI", f"{avg_rsi:.1f}")
+        
+        with col4:
+            bullish_count = len(df_sorted[df_sorted['macd_crossover_type'] == 'Bullish'])
+            st.metric("Bullish MACD", f"{bullish_count}/{len(df_sorted)}")
+        
+        # Sector breakdown
+        st.markdown("---")
         st.subheader("Sector Distribution")
         sector_counts = df_sorted['sector'].value_counts()
         
-        col1, col2 = st.columns([2, 1])
+        sector_df = pd.DataFrame({
+            'Sector': sector_counts.index,
+            'Count': sector_counts.values
+        })
         
-        with col1:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            sector_counts.plot(kind='barh', ax=ax, color='steelblue')
-            ax.set_xlabel('Number of Stocks')
-            ax.set_title('Top Stocks by Sector')
-            ax.grid(True, alpha=0.3)
-            st.pyplot(fig)
-            plt.close()
-        
-        with col2:
-            st.write("**Sector Breakdown:**")
-            for sector, count in sector_counts.items():
-                st.write(f"- {sector}: {count}")
-        
-        # Technical Analysis
-        st.markdown("---")
-        st.header(f"Technical Analysis - Top {technical_top_n} Stocks")
-        
-        top_stocks = df_sorted.head(technical_top_n)['ticker'].tolist()
-        
-        if include_spy:
-            top_stocks.append('SPY')
-        
-        st.info(f"Analyzing: {', '.join(top_stocks)}")
-        
-        # Fetch and analyze technical data
-        technical_data = {}
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for i, symbol in enumerate(top_stocks):
-            status_text.text(f"Fetching technical data for {symbol}... ({i+1}/{len(top_stocks)})")
-            data, error = fetch_stock_data(symbol, period="6mo")
-            if data is not None:
-                technical_data[symbol] = calculate_technical_indicators(data)
-            progress_bar.progress((i + 1) / len(top_stocks))
-        
-        progress_bar.empty()
-        status_text.empty()
-        
-        if not technical_data:
-            st.error("Could not fetch technical data")
-            return
-        
-        # Comparison Chart
-        st.subheader("Price Performance Comparison")
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-        
-        # Normalized price
-        for symbol in technical_data:
-            data = technical_data[symbol]
-            normalized = data['Close'] / data['Close'].iloc[0]
-            ax1.plot(data.index, normalized, label=symbol, linewidth=2)
-        
-        ax1.set_title('Normalized Price Comparison (Base = 1.0)', fontsize=14, fontweight='bold')
-        ax1.set_ylabel('Normalized Price')
-        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax1.grid(True, alpha=0.3)
-        
-        # RSI comparison
-        for symbol in technical_data:
-            data = technical_data[symbol]
-            ax2.plot(data.index, data['RSI'], label=symbol, alpha=0.8)
-        
-        ax2.axhline(y=70, color='red', linestyle='--', alpha=0.7)
-        ax2.axhline(y=30, color='blue', linestyle='--', alpha=0.7)
-        ax2.set_title('RSI Comparison', fontsize=14, fontweight='bold')
-        ax2.set_ylabel('RSI')
-        ax2.set_ylim(0, 100)
-        ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-        
-        # Individual stock charts
-        st.subheader("Individual Stock Analysis")
-        
-        for symbol in top_stocks:
-            if symbol not in technical_data:
-                continue
-            
-            data = technical_data[symbol]
-            latest = data.iloc[-1]
-            
-            # Get company info
-            company_name = symbol
-            for stock_data in growth_data:
-                if stock_data['ticker'] == symbol:
-                    company_name = stock_data['company_name']
-                    break
-            
-            with st.expander(f"{symbol} - {company_name}"):
-                # Metrics
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("Price", f"${latest['Close']:.2f}")
-                
-                with col2:
-                    st.metric("RSI", f"{latest['RSI']:.1f}")
-                
-                with col3:
-                    st.metric("MACD", f"{latest['MACD']:.4f}")
-                
-                with col4:
-                    if not np.isnan(latest['MACD_Crossover_Days']):
-                        cross_type = "Bull" if latest['MACD'] > latest['MACD_Signal'] else "Bear"
-                        st.metric("MACD Cross", f"{int(latest['MACD_Crossover_Days'])}d", cross_type)
-                    else:
-                        st.metric("MACD Cross", "N/A")
-                
-                # Chart
-                fig = plot_technical_chart(data, symbol, company_name)
-                st.pyplot(fig)
-                plt.close()
+        st.dataframe(sector_df, use_container_width=True, hide_index=True)
         
         st.success("Analysis complete!")
     
@@ -452,27 +411,36 @@ def main():
         st.info("Configure your analysis in the sidebar and click 'Start Analysis'")
         
         st.markdown("""
-        ### How It Works
+        ### Features
         
-        1. **Fetch S&P100 Stocks**: Automatically retrieves the current S&P100 constituents
-        2. **Analyst Recommendations**: Ranks stocks by analyst recommendation scores
-        3. **Technical Analysis**: Performs comprehensive technical analysis on top-ranked stocks
-        4. **Visualization**: Creates comparison charts and individual stock analysis
+        - Fetches real-time S&P100 constituent list
+        - Analyst recommendation scores and target prices
+        - Technical indicators: RSI, MACD, MACD Signal, MACD Histogram
+        - MACD crossover tracking with days since last crossover
+        - Bullish/Bearish crossover identification
+        - Next earnings dates
+        - Multiple sorting options
+        - RSI filtering
+        - CSV export functionality
         
-        ### Key Metrics
+        ### Understanding the Metrics
         
-        - **Recommendation Score**: 1.0 (Strong Buy) to 5.0 (Strong Sell)
-        - **Price Upside**: Potential gain based on analyst target prices
-        - **MACD Crossover**: Days since last bullish/bearish crossover
-        - **RSI**: Relative Strength Index for momentum analysis
+        **Analyst Recommendation Score**
+        - Lower is better (1.0 = Strong Buy, 5.0 = Strong Sell)
         
-        ### Analysis Features
+        **RSI (Relative Strength Index)**
+        - < 30: Oversold (potential buy)
+        - > 70: Overbought (potential sell)
+        - 30-70: Neutral
         
-        - Sector distribution analysis
-        - Multi-stock performance comparison
-        - Individual technical charts with MACD, RSI, Bollinger Bands
-        - Volume analysis
-        - Optional SPY benchmark comparison
+        **MACD (Moving Average Convergence Divergence)**
+        - Bullish: MACD > Signal (upward momentum)
+        - Bearish: MACD < Signal (downward momentum)
+        - Histogram: Difference between MACD and Signal
+        
+        **MACD Crossover**
+        - Days Since Crossover: Time elapsed since last crossover
+        - Cross Type: Bullish (buy signal) or Bearish (sell signal)
         """)
 
 if __name__ == "__main__":
