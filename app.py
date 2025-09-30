@@ -109,7 +109,95 @@ def calculate_technical_indicators(data):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
+    # Bollinger Bands
+    df['BB_Middle'] = df['Close'].rolling(window=20).mean()
+    bb_std = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
+    df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
+    df['BB_Position'] = (df['Close'] - df['BB_Lower']) / (df['BB_Upper'] - df['BB_Lower'])
+    
     return df
+
+def calculate_buy_signal_score(latest_data, close_price, sma_20, sma_50):
+    """
+    Calculate buy signal score based on multiple technical indicators
+    Returns: score (0-10), signal strength, and reasons
+    """
+    buy_score = 0
+    reasons = []
+    
+    rsi = latest_data.get('RSI', np.nan)
+    macd = latest_data.get('MACD', np.nan)
+    macd_signal = latest_data.get('MACD_Signal', np.nan)
+    macd_hist = latest_data.get('MACD_Histogram', np.nan)
+    bb_position = latest_data.get('BB_Position', np.nan)
+    
+    # RSI signals (0-3 points)
+    if not np.isnan(rsi):
+        if rsi < 30:
+            buy_score += 3
+            reasons.append("RSI oversold (<30)")
+        elif rsi < 40:
+            buy_score += 2
+            reasons.append("RSI low (<40)")
+        elif rsi > 70:
+            buy_score -= 2
+            reasons.append("RSI overbought (>70)")
+    
+    # MACD signals (0-3 points)
+    if not np.isnan(macd) and not np.isnan(macd_signal):
+        if macd > macd_signal and macd_hist > 0:
+            buy_score += 2
+            reasons.append("MACD bullish crossover")
+        elif macd < macd_signal and macd_hist < 0:
+            buy_score -= 1
+            reasons.append("MACD bearish")
+        
+        # Recent crossover bonus
+        crossover_days = latest_data.get('MACD_Crossover_Days', np.nan)
+        if not np.isnan(crossover_days) and crossover_days <= 5 and macd > macd_signal:
+            buy_score += 1
+            reasons.append(f"Recent bullish cross ({int(crossover_days)}d)")
+    
+    # Trend signals (0-2 points)
+    if not np.isnan(close_price) and not np.isnan(sma_20) and not np.isnan(sma_50):
+        if close_price > sma_20 > sma_50:
+            buy_score += 2
+            reasons.append("Strong uptrend (SMA)")
+        elif close_price < sma_20 < sma_50:
+            buy_score -= 1
+            reasons.append("Downtrend (SMA)")
+    
+    # Bollinger Band signals (0-2 points)
+    if not np.isnan(bb_position):
+        if bb_position < 0.2:
+            buy_score += 2
+            reasons.append("Near lower BB (oversold)")
+        elif bb_position > 0.8:
+            buy_score -= 1
+            reasons.append("Near upper BB (overbought)")
+    
+    # Normalize score to 0-10
+    buy_score = max(0, min(10, buy_score))
+    
+    # Determine signal strength
+    if buy_score >= 7:
+        signal = "Strong Buy"
+        color = "green"
+    elif buy_score >= 5:
+        signal = "Buy"
+        color = "lightgreen"
+    elif buy_score >= 3:
+        signal = "Neutral"
+        color = "gray"
+    elif buy_score >= 1:
+        signal = "Sell"
+        color = "orange"
+    else:
+        signal = "Strong Sell"
+        color = "red"
+    
+    return buy_score, signal, color, reasons
 
 @st.cache_data(ttl=3600)
 def get_analyst_and_technical_data(ticker):
@@ -152,6 +240,13 @@ def get_analyst_and_technical_data(ticker):
         macd_hist = np.nan
         macd_crossover_days = np.nan
         macd_crossover_type = "N/A"
+        bb_position = np.nan
+        sma_20 = np.nan
+        sma_50 = np.nan
+        buy_score = 0
+        buy_signal = "N/A"
+        buy_signal_color = "gray"
+        buy_reasons = []
         
         if hist_data is not None:
             tech_data = calculate_technical_indicators(hist_data)
@@ -161,6 +256,9 @@ def get_analyst_and_technical_data(ticker):
             macd = latest['MACD']
             macd_signal = latest['MACD_Signal']
             macd_hist = latest['MACD_Histogram']
+            bb_position = latest['BB_Position']
+            sma_20 = latest['SMA_20']
+            sma_50 = latest['SMA_50']
             
             # Calculate crossover info
             crossover_series, cross_type = calculate_macd_crossover_days(
@@ -175,6 +273,19 @@ def get_analyst_and_technical_data(ticker):
                     macd_crossover_type = "Bullish"
                 else:
                     macd_crossover_type = "Bearish"
+            
+            # Calculate buy signal
+            latest_dict = {
+                'RSI': rsi,
+                'MACD': macd,
+                'MACD_Signal': macd_signal,
+                'MACD_Histogram': macd_hist,
+                'BB_Position': bb_position,
+                'MACD_Crossover_Days': macd_crossover_days
+            }
+            buy_score, buy_signal, buy_signal_color, buy_reasons = calculate_buy_signal_score(
+                latest_dict, current_price, sma_20, sma_50
+            )
         
         return {
             'ticker': ticker,
@@ -191,6 +302,10 @@ def get_analyst_and_technical_data(ticker):
             'macd_histogram': macd_hist,
             'macd_crossover_days': macd_crossover_days,
             'macd_crossover_type': macd_crossover_type,
+            'buy_score': buy_score,
+            'buy_signal': buy_signal,
+            'buy_signal_color': buy_signal_color,
+            'buy_reasons': ', '.join(buy_reasons) if buy_reasons else 'N/A'
         }
     except Exception:
         return None
@@ -208,12 +323,16 @@ def main():
         
         sort_by = st.selectbox(
             "Sort By",
-            ["Analyst Rec Score", "Price Upside %", "RSI", "MACD Histogram"]
+            ["Buy Score", "Analyst Rec Score", "Price Upside %", "RSI", "MACD Histogram"]
         )
         
         filter_rsi = st.checkbox("Filter by RSI", value=False)
         if filter_rsi:
             rsi_min, rsi_max = st.slider("RSI Range", 0, 100, (30, 70))
+        
+        filter_buy_signal = st.checkbox("Filter by Buy Signal", value=False)
+        if filter_buy_signal:
+            min_buy_score = st.slider("Minimum Buy Score", 0, 10, 5)
         
         analyze_button = st.button("Start Analysis", type="primary", use_container_width=True)
         
@@ -276,8 +395,13 @@ def main():
         if filter_rsi:
             df = df[(df['rsi'] >= rsi_min) & (df['rsi'] <= rsi_max)]
         
+        if filter_buy_signal:
+            df = df[df['buy_score'] >= min_buy_score]
+        
         # Sort based on selection
-        if sort_by == "Analyst Rec Score":
+        if sort_by == "Buy Score":
+            df_sorted = df.sort_values('buy_score', ascending=False)
+        elif sort_by == "Analyst Rec Score":
             df_sorted = df.sort_values('analyst_rec_score', ascending=True)
         elif sort_by == "Price Upside %":
             df_sorted = df.sort_values('price_upside_pct', ascending=False)
@@ -295,15 +419,15 @@ def main():
         # Create display dataframe
         display_df = df_sorted[[
             'ticker', 'company_name', 'sector', 'current_price', 'target_price', 
-            'price_upside_pct', 'analyst_rec_score', 'rsi', 'macd', 'macd_signal',
-            'macd_histogram', 'macd_crossover_days', 'macd_crossover_type', 
-            'next_earnings_date'
+            'price_upside_pct', 'analyst_rec_score', 'buy_score', 'buy_signal',
+            'rsi', 'macd', 'macd_signal', 'macd_histogram', 'macd_crossover_days', 
+            'macd_crossover_type', 'buy_reasons', 'next_earnings_date'
         ]].copy()
         
         display_df.columns = [
             'Ticker', 'Company', 'Sector', 'Price', 'Target', 'Upside %', 
-            'Rec Score', 'RSI', 'MACD', 'Signal', 'MACD Hist', 
-            'Cross Days', 'Cross Type', 'Next Earnings'
+            'Rec Score', 'Buy Score', 'Buy Signal', 'RSI', 'MACD', 'Signal', 
+            'MACD Hist', 'Cross Days', 'Cross Type', 'Buy Reasons', 'Next Earnings'
         ]
         
         # Format numeric columns
@@ -311,6 +435,7 @@ def main():
         display_df['Target'] = display_df['Target'].apply(lambda x: f"${x:.2f}" if not np.isnan(x) else "N/A")
         display_df['Upside %'] = display_df['Upside %'].apply(lambda x: f"{x:.1f}%" if not np.isnan(x) else "N/A")
         display_df['Rec Score'] = display_df['Rec Score'].apply(lambda x: f"{x:.2f}" if not np.isnan(x) else "N/A")
+        display_df['Buy Score'] = display_df['Buy Score'].apply(lambda x: f"{x:.1f}" if not np.isnan(x) else "N/A")
         display_df['RSI'] = display_df['RSI'].apply(lambda x: f"{x:.1f}" if not np.isnan(x) else "N/A")
         display_df['MACD'] = display_df['MACD'].apply(lambda x: f"{x:.4f}" if not np.isnan(x) else "N/A")
         display_df['Signal'] = display_df['Signal'].apply(lambda x: f"{x:.4f}" if not np.isnan(x) else "N/A")
@@ -350,10 +475,25 @@ def main():
             else:
                 return ''
         
+        def color_buy_signal(val):
+            if val == 'Strong Buy':
+                return 'background-color: #006400; color: white'
+            elif val == 'Buy':
+                return 'background-color: #90EE90'
+            elif val == 'Neutral':
+                return 'background-color: #D3D3D3'
+            elif val == 'Sell':
+                return 'background-color: #FFA500'
+            elif val == 'Strong Sell':
+                return 'background-color: #FF0000; color: white'
+            else:
+                return ''
+        
         styled_df = display_df.style\
             .applymap(color_rec_score, subset=['Rec Score'])\
             .applymap(color_rsi, subset=['RSI'])\
-            .applymap(color_crossover_type, subset=['Cross Type'])
+            .applymap(color_crossover_type, subset=['Cross Type'])\
+            .applymap(color_buy_signal, subset=['Buy Signal'])
         
         st.dataframe(
             styled_df,
@@ -391,6 +531,34 @@ def main():
         with col4:
             bullish_count = len(df_sorted[df_sorted['macd_crossover_type'] == 'Bullish'])
             st.metric("Bullish MACD", f"{bullish_count}/{len(df_sorted)}")
+        
+        # Buy signal breakdown
+        st.markdown("---")
+        st.subheader("Buy Signal Distribution")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        signal_counts = df_sorted['buy_signal'].value_counts()
+        
+        with col1:
+            strong_buy = signal_counts.get('Strong Buy', 0)
+            st.metric("Strong Buy", strong_buy, help="Buy Score >= 7")
+        
+        with col2:
+            buy = signal_counts.get('Buy', 0)
+            st.metric("Buy", buy, help="Buy Score 5-6")
+        
+        with col3:
+            neutral = signal_counts.get('Neutral', 0)
+            st.metric("Neutral", neutral, help="Buy Score 3-4")
+        
+        with col4:
+            sell = signal_counts.get('Sell', 0)
+            st.metric("Sell", sell, help="Buy Score 1-2")
+        
+        with col5:
+            strong_sell = signal_counts.get('Strong Sell', 0)
+            st.metric("Strong Sell", strong_sell, help="Buy Score 0")
         
         # Sector breakdown
         st.markdown("---")
@@ -441,6 +609,22 @@ def main():
         **MACD Crossover**
         - Days Since Crossover: Time elapsed since last crossover
         - Cross Type: Bullish (buy signal) or Bearish (sell signal)
+        
+        **Buy Score (0-10)**
+        - Combines multiple technical indicators
+        - **Strong Buy (7-10)**: Multiple bullish signals aligned
+        - **Buy (5-6)**: Generally positive momentum
+        - **Neutral (3-4)**: Mixed signals
+        - **Sell (1-2)**: Bearish indicators present
+        - **Strong Sell (0)**: Multiple bearish signals
+        
+        **Buy Score Calculation:**
+        - RSI oversold (<30): +3 points
+        - MACD bullish crossover: +2 points
+        - Recent bullish cross (≤5 days): +1 point
+        - Strong uptrend (SMA): +2 points
+        - Near lower Bollinger Band: +2 points
+        - (Negative points for bearish signals)
         """)
 
 if __name__ == "__main__":
